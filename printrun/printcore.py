@@ -13,679 +13,471 @@
 # You should have received a copy of the GNU General Public License
 # along with Printrun.  If not, see <http://www.gnu.org/licenses/>.
 
-__version__ = "2.0.0rc5"
-
-import sys
-if sys.version_info.major < 3:
-    print("You need to run this on Python 3")
-    sys.exit(-1)
-
-from serial import Serial, SerialException, PARITY_ODD, PARITY_NONE
-from select import error as SelectError
 import threading
-from queue import Queue, Empty as QueueEmpty
+import queue
+import io
 import time
-import platform
-import os
 import logging
-import traceback
-import errno
-import socket
-import re
-from functools import wraps, reduce
-from collections import deque
-from printrun import gcoder
-from .utils import set_utf8_locale, install_locale, decode_utf8
-try:
-    set_utf8_locale()
-except:
-    pass
-install_locale('pronterface')
-from printrun.plugins import PRINTCORE_HANDLER
+import sys
+import serial
 
-def locked(f):
-    @wraps(f)
-    def inner(*args, **kw):
-        with inner.lock:
-            return f(*args, **kw)
-    inner.lock = threading.Lock()
-    return inner
+class Printcore:
+    """Dumb gcode sender.
 
-def control_ttyhup(port, disable_hup):
-    """Controls the HUPCL"""
-    if platform.system() == "Linux":
-        if disable_hup:
-            os.system("stty -F %s -hup" % port)
-        else:
-            os.system("stty -F %s hup" % port)
+    It is "dumb" in the sense that it does not interpret neither the
+    commands nor the output received from the machine. It simply sends
+    commands and reports back the output (if any).
 
-def enable_hup(port):
-    control_ttyhup(port, False)
+    It is "machine agnostic". It can be used to connect to any kind of
+    CNC machine such as milling machines, 3D printers or laser
+    cutters.
 
-def disable_hup(port):
-    control_ttyhup(port, True)
+    Attributes
+    ----------
+    check_interval : float
+        Time interval in seconds to check for responses from the
+        machine. The lower this time, the more CPU intensive
+        `Printcore` will be. (Default is 0.1)
+    on_command_sent
+        Placeholder for a callback function that will be called every
+        time a command is sent to the machine. This function will be
+        called with a sinlge argument: a string containing the command
+        sent.
+    on_feedback_received
+        Placeholder for a callback function that will be called every
+        time feedback is gathered from the machine. This function will
+        be called with one argument: a string containing a single line
+        received from the machine. If multiple lines are received,
+        this function will be called as many times, once per line.
+    on_job_end
+        Placeholder for a callback function that will be called
+        whenever a job is finished. This function will be called with
+        no arguments.
 
-class printcore():
-    def __init__(self, port = None, baud = None, dtr=None):
-        """Initializes a printcore instance. Pass the port and baud rate to
-           connect immediately"""
-        self.baud = None
-        self.dtr = None
-        self.port = None
-        self.analyzer = gcoder.GCode()
-        # Serial instance connected to the printer, should be None when
-        # disconnected
-        self.printer = None
-        # clear to send, enabled after responses
-        # FIXME: should probably be changed to a sliding window approach
-        self.clear = 0
-        # The printer has responded to the initial command and is active
-        self.online = False
-        # is a print currently running, true if printing, false if paused
-        self.printing = False
-        self.mainqueue = None
-        self.priqueue = Queue(0)
-        self.queueindex = 0
-        self.lineno = 0
-        self.resendfrom = -1
-        self.paused = False
-        self.sentlines = {}
-        self.log = deque(maxlen = 10000)
-        self.sent = []
-        self.writefailures = 0
-        self.tempcb = None  # impl (wholeline)
-        self.recvcb = None  # impl (wholeline)
-        self.sendcb = None  # impl (wholeline)
-        self.preprintsendcb = None  # impl (wholeline)
-        self.printsendcb = None  # impl (wholeline)
-        self.layerchangecb = None  # impl (wholeline)
-        self.errorcb = None  # impl (wholeline)
-        self.startcb = None  # impl ()
-        self.endcb = None  # impl ()
-        self.onlinecb = None  # impl ()
-        self.loud = False  # emit sent and received lines to terminal
-        self.tcp_streaming_mode = False
-        self.greetings = ['start', 'Grbl ']
-        self.wait = 0  # default wait period for send(), send_now()
-        self.read_thread = None
-        self.stop_read_thread = False
-        self.send_thread = None
-        self.stop_send_thread = False
-        self.print_thread = None
-        self.event_handler = PRINTCORE_HANDLER
-        for handler in self.event_handler:
-            try: handler.on_init()
-            except: logging.error(traceback.format_exc())
-        if port is not None and baud is not None:
-            self.connect(port, baud)
-        self.xy_feedrate = None
-        self.z_feedrate = None
+    """
 
-    def addEventHandler(self, handler):
-        '''
-        Adds an event handler.
-        
-        @param handler: The handler to be added.
-        '''
-        self.event_handler.append(handler)
+    def __init__(self):
+        self.check_interval = 0.1
+        self.on_command_sent = None
+        self.on_feedback_received = None
+        self.on_job_end = None
 
-    def logError(self, error):
-        for handler in self.event_handler:
-            try: handler.on_error(error)
-            except: logging.error(traceback.format_exc())
-        if self.errorcb:
-            try: self.errorcb(error)
-            except: logging.error(traceback.format_exc())
-        else:
-            logging.error(error)
+        # A queue of commands that will be sent ahead of the standard
+        # command queue
+        self._priority_command_queue = queue.Queue()
+        # A queue of commands to be gradually sent to the
+        # machine. `maxsize` is set to keep memory consumption at a
+        # minimum. This queue will gradually be filled and emptied
+        self._command_queue = queue.Queue(maxsize = 5)
+        # A queue that holds the outputs received from the machine
+        self._report_queue = queue.Queue()
+        # Signal that there are commands awaiting to be sent in any of
+        # the command queues
+        self._command_queue_not_empty = threading.Event()
+        # Signal that the standard command queue is not full, thus it
+        # is ready to accept more commands to be loaded onto it
+        self._command_queue_not_full = threading.Event()
+        # Signal that the command sending process is no longer
+        # paused. It has to be "not_paused" instead of the more
+        # intuitive "paused" to be able to wait for resume
+        self._not_paused = threading.Event()
+        # Signal that the machine has acknowledged the command sent to it
+        self._command_acknowledged = threading.Event()
+        # Placeholder to hold the connection to machine's port or
+        # network socket
+        self._machine = None
+        # Whether `Printcore` is connected to the machine
+        self._connected = False
+        # Whether a job has been started
+        self._working = False
+        # Whether to return or not some feedback from the machine
+        self._report_feedback = False
 
-    @locked
-    def disconnect(self):
-        """Disconnects from printer and pauses the print
+        logging.debug('constructor: initiated a Printcore instance')
+
+    def connect(self, port, baudrate, file=sys.stdout):
+        """Establishes a connection to the machine.
+
+        Parameters
+        ----------
+        port : str
+            Either a device name, such as '/dev/ttyUSB0' or 'COM3', or
+            an URL.
+        baudrate : int
+            Baud rate such as 9600 or 115200.
+        file : Text I/O, optional
+            Either a file or a file-like stream. Any feedback received
+            from the machine will be written to it. (Default is STDOUT)
+
+        Raises
+        ------
+        ConnectionError
+            If an error occurred when attempting to connect
+
         """
-        if self.printer:
-            if self.read_thread:
-                self.stop_read_thread = True
-                if threading.current_thread() != self.read_thread:
-                    self.read_thread.join()
-                self.read_thread = None
-            if self.print_thread:
-                self.printing = False
-                self.print_thread.join()
-            self._stop_sender()
-            try:
-                self.printer.close()
-            except socket.error:
-                pass
-            except OSError:
-                pass
-        for handler in self.event_handler:
-            try: handler.on_disconnect()
-            except: logging.error(traceback.format_exc())
-        self.printer = None
-        self.online = False
-        self.printing = False
 
-    @locked
-    def connect(self, port = None, baud = None, dtr=None):
-        """Set port and baudrate if given, then connect to printer
-        """
-        if self.printer:
-            self.disconnect()
-        if port is not None:
-            self.port = port
-        if baud is not None:
-            self.baud = baud
-        if dtr is not None:
-            self.dtr = dtr
-        if self.port is not None and self.baud is not None:
-            # Connect to socket if "port" is an IP, device if not
-            host_regexp = re.compile("^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$|^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$")
-            is_serial = True
-            if ":" in port:
-                bits = port.split(":")
-                if len(bits) == 2:
-                    hostname = bits[0]
-                    try:
-                        port = int(bits[1])
-                        if host_regexp.match(hostname) and 1 <= port <= 65535:
-                            is_serial = False
-                    except:
-                        pass
-            self.writefailures = 0
-            if not is_serial:
-                self.printer_tcp = socket.socket(socket.AF_INET,
-                                                 socket.SOCK_STREAM)
-                self.printer_tcp.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                self.timeout = 0.25
-                self.printer_tcp.settimeout(1.0)
-                try:
-                    self.printer_tcp.connect((hostname, port))
-                    self.printer_tcp.settimeout(self.timeout)
-                    self.printer = self.printer_tcp.makefile()
-                except socket.error as e:
-                    if(e.strerror is None): e.strerror=""
-                    self.logError(_("Could not connect to %s:%s:") % (hostname, port) +
-                                  "\n" + _("Socket error %s:") % e.errno +
-                                  "\n" + e.strerror)
-                    self.printer = None
-                    self.printer_tcp = None
-                    return
-            else:
-                disable_hup(self.port)
-                self.printer_tcp = None
-                try:
-                    self.printer = Serial(port = self.port,
-                                          baudrate = self.baud,
-                                          timeout = 0.25,
-                                          parity = PARITY_ODD)
-                    self.printer.close()
-                    self.printer.parity = PARITY_NONE
-                    try:  #this appears not to work on many platforms, so we're going to call it but not care if it fails
-                        self.printer.setDTR(dtr);
-                    except:
-                        #self.logError(_("Could not set DTR on this platform")) #not sure whether to output an error message
-                        pass
-                    self.printer.open()
-                except SerialException as e:
-                    self.logError(_("Could not connect to %s at baudrate %s:") % (self.port, self.baud) +
-                                  "\n" + _("Serial error: %s") % e)
-                    self.printer = None
-                    return
-                except IOError as e:
-                    self.logError(_("Could not connect to %s at baudrate %s:") % (self.port, self.baud) +
-                                  "\n" + _("IO error: %s") % e)
-                    self.printer = None
-                    return
-            for handler in self.event_handler:
-                try: handler.on_connect()
-                except: logging.error(traceback.format_exc())
-            self.stop_read_thread = False
-            self.read_thread = threading.Thread(target = self._listen)
-            self.read_thread.start()
-            self._start_sender()
+        if self._connected:
+            return
 
-    def reset(self):
-        """Reset the printer
-        """
-        if self.printer and not self.printer_tcp:
-            self.printer.setDTR(1)
-            time.sleep(0.2)
-            self.printer.setDTR(0)
-
-    def _readline(self):
+        # Create and connect to either a socket or a serial port
         try:
-            try:
-                try:
-                    line = self.printer.readline().decode('ascii')
-                except UnicodeDecodeError:
-                    self.logError(_("Got rubbish reply from %s at baudrate %s:") % (self.port, self.baud) +
-                                  "\n" + _("Maybe a bad baudrate?"))
-                    return None
-                if self.printer_tcp and not line:
-                    raise OSError(-1, "Read EOF from socket")
-            except socket.timeout:
-                return ""
+            self._machine = serial.serial_for_url(url = port,
+                                                  baudrate = baudrate)
+        except serial.SerialException as e:
+            raise ConnectionError(e.strerror)
 
-            if len(line) > 1:
-                self.log.append(line)
-                for handler in self.event_handler:
-                    try: handler.on_recv(line)
-                    except: logging.error(traceback.format_exc())
-                if self.recvcb:
-                    try: self.recvcb(line)
-                    except: self.logError(traceback.format_exc())
-                if self.loud: logging.info("RECV: %s" % line.rstrip())
-            return line
-        except SelectError as e:
-            if 'Bad file descriptor' in e.args[1]:
-                self.logError(_("Can't read from printer (disconnected?) (SelectError {0}): {1}").format(e.errno, decode_utf8(e.strerror)))
-                return None
-            else:
-                self.logError(_("SelectError ({0}): {1}").format(e.errno, decode_utf8(e.strerror)))
-                raise
-        except SerialException as e:
-            self.logError(_("Can't read from printer (disconnected?) (SerialException): {0}").format(decode_utf8(str(e))))
-            return None
-        except socket.error as e:
-            self.logError(_("Can't read from printer (disconnected?) (Socket error {0}): {1}").format(e.errno, decode_utf8(e.strerror)))
-            return None
-        except OSError as e:
-            if e.errno == errno.EAGAIN:  # Not a real error, no data was available
-                return ""
-            self.logError(_("Can't read from printer (disconnected?) (OS Error {0}): {1}").format(e.errno, e.strerror))
-            return None
+        self._connected = True
+        logging.info('Connected to %s at baudrate %d', port, baudrate)
 
-    def _listen_can_continue(self):
-        if self.printer_tcp:
-            return not self.stop_read_thread and self.printer
-        return (not self.stop_read_thread
-                and self.printer
-                and self.printer.isOpen())
+        # Create and start the sender thread
+        sender_thread = threading.Thread(name = 'sender-thread',
+                                         target = self._sender)
+        sender_thread.start()
 
-    def _listen_until_online(self):
-        while not self.online and self._listen_can_continue():
-            self._send("M105")
-            if self.writefailures >= 4:
-                logging.error(_("Aborting connection attempt after 4 failed writes."))
-                return
-            empty_lines = 0
-            while self._listen_can_continue():
-                line = self._readline()
-                if line is None: break  # connection problem
-                # workaround cases where M105 was sent before printer Serial
-                # was online an empty line means read timeout was reached,
-                # meaning no data was received thus we count those empty lines,
-                # and once we have seen 15 in a row, we just break and send a
-                # new M105
-                # 15 was chosen based on the fact that it gives enough time for
-                # Gen7 bootloader to time out, and that the non received M105
-                # issues should be quite rare so we can wait for a long time
-                # before resending
-                if not line:
-                    empty_lines += 1
-                    if empty_lines == 15: break
-                else: empty_lines = 0
-                if line.startswith(tuple(self.greetings)) \
-                   or line.startswith('ok') or "T:" in line:
-                    self.online = True
-                    for handler in self.event_handler:
-                        try: handler.on_online()
-                        except: logging.error(traceback.format_exc())
-                    if self.onlinecb:
-                        try: self.onlinecb()
-                        except: self.logError(traceback.format_exc())
-                    return
+        # Create and start the listener thread
+        listener_thread = threading.Thread(name = 'listener-thread',
+                                           target = self._listener,
+                                           args = (file,))
+        listener_thread.start()
 
-    def _listen(self):
-        """This function acts on messages from the firmware
+    def is_connected(self):
+        """Returns True if `Printcore` is connected to a machine."""
+
+        return self._connected
+
+    def disconnect(self):
+        """Terminates the connection to the machine"""
+
+        if not self._connected:
+            return
+        self._connected = False
+
+        if self._working:
+            self.cancel()
+
+        # If sender thread is waiting for new commands,
+        # command-queue-not-empty is signalled so it stops waiting and
+        # detects the disconnection
+        if not self._command_queue_not_empty.is_set():
+            self._command_queue_not_empty.set()
+            logging.debug('disconnect: signalled command-queue-not-empty')
+        # If sender thread is waiting for a command acknowledgement,
+        # command-acknowledged is signalled so it stops waiting and
+        # detects the disconnection
+        if not self._command_acknowledged.is_set():
+            self._command_acknowledged.set()
+            logging.debug('disconnect: signalled command-acknowledged')
+
+        # Wait for the listener thread to recheck for connection
+        time.sleep(self.check_interval)
+
+        self._machine.close()
+        logging.info('Disconnected from %s', self._machine.port)
+
+    def send_now(self, command):
+        """Sends a single command ahead of the command queue.
+
+	Parameters
+        ----------
+        command : str
+            Command to be sent to the machine.
+         
+        Returns
+        -------
+        str
+            String containing the feedback received from the machine
+	    after sending the command.
+
         """
-        self.clear = True
-        if not self.printing:
-            self._listen_until_online()
-        while self._listen_can_continue():
-            line = self._readline()
-            if line is None:
-                break
-            if line.startswith('DEBUG_'):
+
+        logging.debug('send-now: treating command: "%s"', command)
+        parsed_command = self._parse_command(command)
+        if parsed_command is not None:
+            self._load_now(parsed_command)
+            logging.debug('send-now: waiting for feedback')
+            report = self._report_queue.get()
+            logging.debug('send-now: got "%s" reported', str(report))
+        return report
+
+    def start(self, file=sys.stdin):
+        """Gradually reads and sends commands to the machine.
+        
+        It starts a process or job that will run in the
+        background. This process reads commands one by one from the
+        given input stream and sends them to the machine.
+
+        Only one job can be processed at a time. If called when
+        another job is running it will do nothing.
+
+        Parameters
+        ----------
+        file : Text I/O
+            Either a file or a file-like stream from where the
+            commands are read. (Default is STDIN)
+
+        """
+
+        # Check whether another work is running
+        if self._working:
+            logging.warning('Another work is already running!')
+            return
+
+        self._working = True
+        self._lines_read = 0
+        logging.info('Starting work...')
+
+        self._not_paused.set()
+        logging.debug('start: cleared paused signal')
+
+        # Create and start loader thread
+        loader_thread = threading.Thread(name = 'loader-thread',
+                                         target = self._loader,
+                                         args = (file,))
+        loader_thread.start()
+        self._command_queue_not_full.set()
+
+    def is_working(self):
+        """Returns True if a job is being processed."""
+
+        return self._working
+
+    def lines_read(self):
+        """Returns the number of lines read by the current job."""
+
+        return self._lines_read
+    
+    def pause(self):
+        """Pause the ongoing job."""
+
+        logging.info('Pausing work...')
+        if self._not_paused.is_set(): # if paused == False
+            self._not_paused.clear()  #     paused = True
+            logging.debug('pause: signal paused')
+
+    def is_paused(self):
+        """Returns True if a job is paused."""
+
+        return not self._not_paused.is_set() # return paused
+            
+    def resume(self):
+        """Resume the (previously paused) job."""
+
+        logging.info('Resuming work...')
+        if not self._not_paused.is_set(): # if paused == True
+            self._not_paused.set()        #     paused = False
+            logging.debug('resume: clear paused signal')
+
+        # if sender thread was waiting for new commands, signal
+        # command-queue-not-empty so it resumes sending
+        if not self._command_queue_not_empty.is_set():
+            self._command_queue_not_empty.set()
+            logging.debug('resume: signalled command-queue-not-empty')
+
+    def cancel(self):
+        """Terminates the ongoing job."""
+
+        if not self._working:
+            return
+        logging.info('Cancelling work...')
+        self._working = False
+
+        # if the job was paused, the loader thread might be waiting for
+        # resume. Thus not-paused is signalled so it detects the job
+        # cancellation
+        if not self._not_paused.is_set(): # if paused == True
+            self._not_paused.set()
+            logging.debug('cancel: paused signal cleared')
+        # if the loader thread is waiting for a slot in the command
+        # queue, signal there is a slot so it detects the job
+        # cancellation
+        if not self._command_queue_not_full.is_set():
+            self._command_queue_not_full.set()
+            logging.debug('cancel: command-queue-not-full signalled')
+        self._flush_command_queue()
+
+    def _loader(self, file):
+        # loader-thread
+        # This thread gradually reads lines from 'file', extract
+        # commands, and loads them onto the command queue.
+        for line in file:
+            logging.debug('loader: read line: "%s"', line)
+            command = self._parse_command(line)
+            if command is None:
                 continue
-            if line.startswith(tuple(self.greetings)) or line.startswith('ok'):
-                self.clear = True
-            if line.startswith('ok') and "T:" in line:
-                for handler in self.event_handler:
-                    try: handler.on_temp(line)
-                    except: logging.error(traceback.format_exc())
-            if line.startswith('ok') and "T:" in line and self.tempcb:
-                # callback for temp, status, whatever
-                try: self.tempcb(line)
-                except: self.logError(traceback.format_exc())
-            elif line.startswith('Error'):
-                self.logError(line)
-            # Teststrings for resend parsing       # Firmware     exp. result
-            # line="rs N2 Expected checksum 67"    # Teacup       2
-            if line.lower().startswith("resend") or line.startswith("rs"):
-                for haystack in ["N:", "N", ":"]:
-                    line = line.replace(haystack, " ")
-                linewords = line.split()
-                while len(linewords) != 0:
-                    try:
-                        toresend = int(linewords.pop(0))
-                        self.resendfrom = toresend
-                        break
-                    except:
-                        pass
-                self.clear = True
-        self.clear = True
 
-    def _start_sender(self):
-        self.stop_send_thread = False
-        self.send_thread = threading.Thread(target = self._sender)
-        self.send_thread.start()
+            while self._connected and self._working:
+                logging.debug('loader: waiting for a slot in command queue')
+                self._command_queue_not_full.wait()
+                logging.debug('loader: detected command-queue-not-full')
+                if not self._not_paused.is_set(): # if paused == True
+                    logging.debug('loader: detected job pause, waiting')
+                    self._not_paused.wait()
+                    logging.debug('loader: detected resume')
+                elif self._command_queue.full():
+                    logging.debug('loader: command queue full')
+                    self._command_queue_not_full.clear()
+                    logging.debug('loader: cleared command-queue-not-full')
+                    continue
+                else:
+                    self._load(command)
+                    break
+            else:
+                # if cancelled or disconnected -> exit the for loop
+                logging.debug('loader: job cancellation detected')
+                return
 
-    def _stop_sender(self):
-        if self.send_thread:
-            self.stop_send_thread = True
-            self.send_thread.join()
-            self.send_thread = None
+
+        logging.debug('loader: reached end of file')
+        # Call job end callback function
+        if self.on_job_end:
+            self.on_job_end()
+
+    def _load_now(self, command):
+        self._priority_command_queue.put(command)
+        logging.debug('now-load: loaded priority command: "%s"', str(command))
+        if not self._command_queue_not_empty.is_set():
+            self._command_queue_not_empty.set()
+            logging.debug('now-load: signalled command-queue-not-empty')
+
+    def _load(self, command):
+        self._command_queue.put(command)
+        logging.debug('load: loaded command "%s"', str(command))
+        if not self._command_queue_not_empty.is_set():
+            self._command_queue_not_empty.set()
+            logging.debug('load: signalled command-queue-not-empty')
 
     def _sender(self):
-        while not self.stop_send_thread:
-            try:
-                command = self.priqueue.get(True, 0.1)
-            except QueueEmpty:
+        while self._connected:
+            # wait for new commands
+            logging.debug('sender: waiting for new commands')
+            self._command_queue_not_empty.wait()
+            logging.debug('sender: received command-queue-not-empty signal')
+
+            # expect a new command-acknowledged signal after sending
+            if self._command_acknowledged.is_set():
+                self._command_acknowledged.clear()
+                logging.debug('sender: command-acknowledged cleared')
+
+            # query the command queues for commands
+            if not self._priority_command_queue.empty():
+                logging.debug('sender: priority command queue not empty')
+                command = self._priority_command_queue.get()
+                self._report_feedback = True
+                logging.debug('sender: got command "%s"', str(command))
+            elif (self._working
+                  and self._not_paused.is_set() # paused = False
+                  and not self._command_queue.empty()):
+                logging.debug('sender: command queue not empty')
+                command = self._command_queue.get()
+                self._report_feedback = False
+                logging.debug('sender: got command "%s"', command.code)
+                if not self._command_queue_not_full.is_set():
+                    self._command_queue_not_full.set()
+                    logging.debug(
+                        'sender: signalled command-queue-not-full')
+            else:
+                logging.debug('sender: found no commands to be sent')
+                self._command_queue_not_empty.clear()
+                logging.debug('sender: cleared command-queue-not-empty')
                 continue
-            while self.printer and self.printing and not self.clear:
-                time.sleep(0.001)
+
             self._send(command)
-            while self.printer and self.printing and not self.clear:
-                time.sleep(0.001)
 
-    def _checksum(self, command):
-        return reduce(lambda x, y: x ^ y, map(ord, command))
-
-    def startprint(self, gcode, startindex = 0):
-        """Start a print, gcode is an array of gcode commands.
-        returns True on success, False if already printing.
-        The print queue will be replaced with the contents of the data array,
-        the next line will be set to 0 and the firmware notified. Printing
-        will then start in a parallel thread.
-        """
-        if self.printing or not self.online or not self.printer:
-            return False
-        self.queueindex = startindex
-        self.mainqueue = gcode
-        self.printing = True
-        self.lineno = 0
-        self.resendfrom = -1
-        self._send("M110", -1, True)
-        if not gcode or not gcode.lines:
-            return True
-        self.clear = False
-        resuming = (startindex != 0)
-        self.print_thread = threading.Thread(target = self._print,
-                                             kwargs = {"resuming": resuming})
-        self.print_thread.start()
-        return True
-
-    def cancelprint(self):
-        self.pause()
-        self.paused = False
-        self.mainqueue = None
-        self.clear = True
-
-    # run a simple script if it exists, no multithreading
-    def runSmallScript(self, filename):
-        if filename is None: return
-        f = None
-        try:
-            with open(filename) as f:
-                for i in f:
-                    l = i.replace("\n", "")
-                    l = l[:l.find(";")]  # remove comments
-                    self.send_now(l)
-        except:
-            pass
-
-    def pause(self):
-        """Pauses the print, saving the current position.
-        """
-        if not self.printing: return False
-        self.paused = True
-        self.printing = False
-
-        # try joining the print thread: enclose it in try/except because we
-        # might be calling it from the thread itself
-        try:
-            self.print_thread.join()
-        except RuntimeError as e:
-            if e.message == "cannot join current thread":
-                pass
-            else:
-                self.logError(traceback.format_exc())
-        except:
-            self.logError(traceback.format_exc())
-
-        self.print_thread = None
-
-        # saves the status
-        self.pauseX = self.analyzer.abs_x
-        self.pauseY = self.analyzer.abs_y
-        self.pauseZ = self.analyzer.abs_z
-        self.pauseE = self.analyzer.abs_e
-        self.pauseF = self.analyzer.current_f
-        self.pauseRelative = self.analyzer.relative
-
-    def resume(self):
-        """Resumes a paused print.
-        """
-        if not self.paused: return False
-        if self.paused:
-            # restores the status
-            self.send_now("G90")  # go to absolute coordinates
-
-            xyFeedString = ""
-            zFeedString = ""
-            if self.xy_feedrate is not None:
-                xyFeedString = " F" + str(self.xy_feedrate)
-            if self.z_feedrate is not None:
-                zFeedString = " F" + str(self.z_feedrate)
-
-            self.send_now("G1 X%s Y%s%s" % (self.pauseX, self.pauseY,
-                                            xyFeedString))
-            self.send_now("G1 Z" + str(self.pauseZ) + zFeedString)
-            self.send_now("G92 E" + str(self.pauseE))
-
-            # go back to relative if needed
-            if self.pauseRelative: self.send_now("G91")
-            # reset old feed rate
-            self.send_now("G1 F" + str(self.pauseF))
-
-        self.paused = False
-        self.printing = True
-        self.print_thread = threading.Thread(target = self._print,
-                                             kwargs = {"resuming": True})
-        self.print_thread.start()
-
-    def send(self, command, wait = 0):
-        """Adds a command to the checksummed main command queue if printing, or
-        sends the command immediately if not printing"""
-
-        if self.online:
-            if self.printing:
-                self.mainqueue.append(command)
-            else:
-                self.priqueue.put_nowait(command)
+            # wait for command acknowledgement
+            logging.debug('sender: waiting for acknowledgement')
+            self._command_acknowledged.wait()
+            logging.debug('sender: command acknowledged')
         else:
-            self.logError(_("Not connected to printer."))
-
-    def send_now(self, command, wait = 0):
-        """Sends a command to the printer ahead of the command queue, without a
-        checksum"""
-        if self.online:
-            self.priqueue.put_nowait(command)
-        else:
-            self.logError(_("Not connected to printer."))
-
-    def _print(self, resuming = False):
-        self._stop_sender()
-        try:
-            for handler in self.event_handler:
-                try: handler.on_start(resuming)
-                except: logging.error(traceback.format_exc())
-            if self.startcb:
-                # callback for printing started
-                try: self.startcb(resuming)
-                except:
-                    self.logError(_("Print start callback failed with:") +
-                                  "\n" + traceback.format_exc())
-            while self.printing and self.printer and self.online:
-                self._sendnext()
-            self.sentlines = {}
-            self.log.clear()
-            self.sent = []
-            for handler in self.event_handler:
-                try: handler.on_end()
-                except: logging.error(traceback.format_exc())
-            if self.endcb:
-                # callback for printing done
-                try: self.endcb()
-                except:
-                    self.logError(_("Print end callback failed with:") +
-                                  "\n" + traceback.format_exc())
-        except:
-            self.logError(_("Print thread died due to the following error:") +
-                          "\n" + traceback.format_exc())
-        finally:
-            self.print_thread = None
-            self._start_sender()
-
-    def process_host_command(self, command):
-        """only ;@pause command is implemented as a host command in printcore, but hosts are free to reimplement this method"""
-        command = command.lstrip()
-        if command.startswith(";@pause"):
-            self.pause()
-
-    def _sendnext(self):
-        if not self.printer:
+            # if disconnected -> end thread
+            logging.debug('sender: detected disconnection')
             return
-        while self.printer and self.printing and not self.clear:
-            time.sleep(0.001)
-        # Only wait for oks when using serial connections or when not using tcp
-        # in streaming mode
-        if not self.printer_tcp or not self.tcp_streaming_mode:
-            self.clear = False
-        if not (self.printing and self.printer and self.online):
-            self.clear = True
-            return
-        if self.resendfrom < self.lineno and self.resendfrom > -1:
-            self._send(self.sentlines[self.resendfrom], self.resendfrom, False)
-            self.resendfrom += 1
-            return
-        self.resendfrom = -1
-        if not self.priqueue.empty():
-            self._send(self.priqueue.get_nowait())
-            self.priqueue.task_done()
-            return
-        if self.printing and self.queueindex < len(self.mainqueue):
-            (layer, line) = self.mainqueue.idxs(self.queueindex)
-            gline = self.mainqueue.all_layers[layer][line]
-            if self.queueindex > 0:
-                (prev_layer, prev_line) = self.mainqueue.idxs(self.queueindex - 1)
-                if prev_layer != layer:
-                    for handler in self.event_handler:
-                        try: handler.on_layerchange(layer)
-                        except: logging.error(traceback.format_exc())
-            if self.layerchangecb and self.queueindex > 0:
-                (prev_layer, prev_line) = self.mainqueue.idxs(self.queueindex - 1)
-                if prev_layer != layer:
-                    try: self.layerchangecb(layer)
-                    except: self.logError(traceback.format_exc())
-            for handler in self.event_handler:
-                try: handler.on_preprintsend(gline, self.queueindex, self.mainqueue)
-                except: logging.error(traceback.format_exc())
-            if self.preprintsendcb:
-                if self.queueindex + 1 < len(self.mainqueue):
-                    (next_layer, next_line) = self.mainqueue.idxs(self.queueindex + 1)
-                    next_gline = self.mainqueue.all_layers[next_layer][next_line]
-                else:
-                    next_gline = None
-                gline = self.preprintsendcb(gline, next_gline)
-            if gline is None:
-                self.queueindex += 1
-                self.clear = True
-                return
-            tline = gline.raw
-            if tline.lstrip().startswith(";@"):  # check for host command
-                self.process_host_command(tline)
-                self.queueindex += 1
-                self.clear = True
-                return
 
-            # Strip comments
-            tline = gcoder.gcode_strip_comment_exp.sub("", tline).strip()
-            if tline:
-                self._send(tline, self.lineno, True)
-                self.lineno += 1
-                for handler in self.event_handler:
-                    try: handler.on_printsend(gline)
-                    except: logging.error(traceback.format_exc())
-                if self.printsendcb:
-                    try: self.printsendcb(gline)
-                    except: self.logError(traceback.format_exc())
+    def _send(self, command):
+        # Sends the command to the machine 
+        logging.debug('send: sending command "%s" to machine', command.code)
+        code = command.code
+        encoded_code = (code + '\n').encode()
+        self._machine.write(encoded_code)
+        logging.debug('send: sent command "%s"', code)
+
+        # If a function is set for sent commands, call it
+        if self.on_command_sent:
+            self.on_command_sent(code)
+
+    def _listener(self, file):
+        while self._connected:
+            feedback = self._listen()
+            if feedback is not None:
+                self._parse_feedback(feedback)
+                file.write(feedback)
             else:
-                self.clear = True
-            self.queueindex += 1
+                #FIXME: ugly hack, please improve this
+                time.sleep(self.check_interval) 
+                continue
         else:
-            self.printing = False
-            self.clear = True
-            if not self.paused:
-                self.queueindex = 0
-                self.lineno = 0
-                self._send("M110", -1, True)
+            # if disconnected -> end thread
+            logging.debug('listener: detected disconnection')
+            return
 
-    def _send(self, command, lineno = 0, calcchecksum = False):
-        # Only add checksums if over serial (tcp does the flow control itself)
-        if calcchecksum and not self.printer_tcp:
-            prefix = "N" + str(lineno) + " " + command
-            command = prefix + "*" + str(self._checksum(prefix))
-            if "M110" not in command:
-                self.sentlines[lineno] = command
-        if self.printer:
-            self.sent.append(command)
-            # run the command through the analyzer
-            gline = None
-            try:
-                gline = self.analyzer.append(command, store = False)
-            except:
-                logging.warning(_("Could not analyze command %s:") % command +
-                                "\n" + traceback.format_exc())
-            if self.loud:
-                logging.info("SENT: %s" % command)
+    def _listen(self):
+        if self._machine.in_waiting:
+            logging.debug("listen: detected feedback from the machine")
+            encoded_feedback = self._machine.readline()
+            feedback = encoded_feedback.decode()
+            logging.debug("listen: received %s", feedback)
 
-            for handler in self.event_handler:
-                try: handler.on_send(command, gline)
-                except: logging.error(traceback.format_exc())
-            if self.sendcb:
-                try: self.sendcb(command, gline)
-                except: self.logError(traceback.format_exc())
-            try:
-                self.printer.write((command + "\n").encode('ascii'))
-                if self.printer_tcp:
-                    try:
-                        self.printer.flush()
-                    except socket.timeout:
-                        pass
-                self.writefailures = 0
-            except socket.error as e:
-                if e.errno is None:
-                    self.logError(_("Can't write to printer (disconnected ?):") +
-                                  "\n" + traceback.format_exc())
-                else:
-                    self.logError(_("Can't write to printer (disconnected?) (Socket error {0}): {1}").format(e.errno, decode_utf8(e.strerror)))
-                self.writefailures += 1
-            except SerialException as e:
-                self.logError(_("Can't write to printer (disconnected?) (SerialException): {0}").format(decode_utf8(str(e))))
-                self.writefailures += 1
-            except RuntimeError as e:
-                self.logError(_("Socket connection broken, disconnected. ({0}): {1}").format(e.errno, decode_utf8(e.strerror)))
-                self.writefailures += 1
+            # If a function is set for received feedback, call it
+            if self.on_feedback_received:
+                self.on_feedback_received(feedback)
+
+            return feedback
+        else:
+            return None
+
+        
+    def _flush_command_queue(self):
+        while not self._command_queue.empty():
+            self._command_queue.get()
+
+    def _parse_command(self, line):
+        # extract the gcode from a line
+        # returns an instance of the _Command class or None
+        logging.debug('command-parser: parsing "%s"', line)
+        code = line.split(';', 1)[0]  # strip ;-style comments
+        code = code.split('(', 1)[0]  # strip ()-style comments
+        code = code.rstrip()          # strip trailing spaces and newlines
+        if code == "":
+            logging.debug('command_parser: no command code found')
+            return None
+        else:
+            command = _Command(code)
+            logging.debug('command-parser: parsed into code "%s"', code)
+            return command
+
+    def _parse_feedback(self, feedback):
+        logging.debug('feedback-parser: parsing "%s"', feedback)
+        if feedback.startswith('ok'):
+            logging.debug('feedback-parser: detected command acknowledgement')
+            if self._report_feedback == True:
+                report = self._parse_report(feedback)
+                logging.debug('feedback-parser: reporting %s"', feedback)
+                self._report_queue.put(report)
+                logging.debug('feedback-parser: reported')
+            if not self._command_acknowledged.is_set():
+                self._command_acknowledged.set()
+                logging.debug('feedback-parser: command-acknowledged signalled')
+        elif feedback.lower().startswith('resend'):
+            logging.debug('feedback-parser: detected command resend request')
+
+    def _parse_report(self, feedback):
+       report = feedback.strip('\n')
+       return report
+            
+class _Command:
+    def __init__(self, code, id = None):
+        self.code = code     # (str)
+        self.checksum = None # (int)  checksum?
+        self.id = id         # (int)  id?
+
+    def __str__(self):
+        return self.code
